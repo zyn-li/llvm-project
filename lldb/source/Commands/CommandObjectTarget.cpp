@@ -2866,6 +2866,227 @@ protected:
   }
 };
 
+class CommandObjectTargetModulesReplace : public CommandObjectParsed {
+public:
+  CommandObjectTargetModulesReplace(CommandInterpreter &interpreter)
+      : CommandObjectParsed(
+            interpreter, "target modules replace",
+            "Replace one of the target's current modules with another one.",
+            nullptr, eCommandRequiresTarget),
+        m_module_option(LLDB_OPT_SET_1, false, "shlib", 's',
+                        lldb::eModuleCompletion, eArgTypeShlibName,
+                        "Name of the module to replace. Defaults to the file "
+                        "name of the new module.") {
+    SetHelpLong(R"HELP(
+Replace a module in the current target with the module at the given path,
+loading the new module at the address the old one was loaded at.
+
+This is most useful when debugging a core file or a minidump: those usually
+only contain process memory, so LLDB creates placeholder modules for the
+binaries it cannot locate, and "image list" marks them with "(*)". Once the
+real binary has been found it can be swapped in without recreating the target:
+
+    (lldb) target modules replace /path/to/real/binary
+
+The module to replace is located by the UUID of the new module, falling back to
+its file name. Use --shlib when the names differ, or --uuid to disambiguate.)HELP");
+    m_option_group.Append(&m_uuid_option_group, LLDB_OPT_SET_ALL,
+                          LLDB_OPT_SET_1);
+    m_option_group.Append(&m_module_option, LLDB_OPT_SET_ALL, LLDB_OPT_SET_1);
+    m_option_group.Finalize();
+    AddSimpleArgumentList(eArgTypePath);
+  }
+
+  ~CommandObjectTargetModulesReplace() override = default;
+
+  Options *GetOptions() override { return &m_option_group; }
+
+protected:
+  OptionGroupOptions m_option_group;
+  OptionGroupUUID m_uuid_option_group;
+  OptionGroupFile m_module_option;
+
+  /// Find the module in the target that \a new_module_spec should replace.
+  /// Returns an error if there is no single obvious candidate.
+  llvm::Expected<ModuleSP>
+  FindModuleToReplace(const ModuleSpec &new_module_spec) {
+    Target *target = GetTarget();
+    assert(target && "target guaranteed by eCommandRequiresTarget");
+
+    // An explicitly given UUID or module name always wins over anything we can
+    // infer from the new module. When neither is given, look for a module with
+    // the same UUID as the new module: placeholder modules created for a core
+    // file usually know the UUID of the binary they stand in for even though
+    // the binary itself could not be located.
+    ModuleList matches;
+    std::string criterion;
+
+    auto find_by_uuid = [&](const UUID &uuid) {
+      ModuleSpec spec;
+      spec.GetUUID() = uuid;
+      criterion = "UUID " + uuid.GetAsString();
+      target->GetImages().FindModules(spec, matches);
+    };
+    auto find_by_name = [&](llvm::StringRef name) {
+      ModuleSpec spec;
+      spec.GetFileSpec().SetFilename(name);
+      criterion = ("name " + name).str();
+      target->GetImages().FindModules(spec, matches);
+    };
+
+    if (m_uuid_option_group.GetOptionValue().OptionWasSet()) {
+      find_by_uuid(m_uuid_option_group.GetOptionValue().GetCurrentValue());
+    } else if (m_module_option.GetOptionValue().OptionWasSet()) {
+      find_by_name(
+          m_module_option.GetOptionValue().GetCurrentValue().GetFilename());
+    } else if (new_module_spec.GetUUID().IsValid()) {
+      // Matching by the new module's UUID is a guess, so fall back to its file
+      // name if it finds nothing. An explicit --uuid or --shlib is not a
+      // guess: if it matches nothing, that is an error.
+      find_by_uuid(new_module_spec.GetUUID());
+      if (matches.IsEmpty()) {
+        std::string uuid_criterion = std::move(criterion);
+        find_by_name(new_module_spec.GetFileSpec().GetFilename());
+        if (matches.IsEmpty())
+          criterion = uuid_criterion + " or " + criterion;
+      }
+    } else {
+      find_by_name(new_module_spec.GetFileSpec().GetFilename());
+    }
+
+    if (matches.IsEmpty())
+      return llvm::createStringError("no module in the target matches %s",
+                                     criterion.c_str());
+    if (matches.GetSize() > 1)
+      return llvm::createStringError(
+          "%zu modules in the target match %s, use the --uuid option to "
+          "resolve the ambiguity",
+          matches.GetSize(), criterion.c_str());
+    return matches.GetModuleAtIndex(0);
+  }
+
+  void DoExecute(Args &args, CommandReturnObject &result) override {
+    if (args.GetArgumentCount() != 1) {
+      result.AppendError("exactly one module path must be specified");
+      return;
+    }
+
+    Target *target = GetTarget();
+    assert(target && "target guaranteed by eCommandRequiresTarget");
+
+    llvm::StringRef path = args[0].ref();
+    FileSpec file_spec(path);
+    FileSystem::Instance().Resolve(file_spec);
+    if (!FileSystem::Instance().Exists(file_spec)) {
+      result.AppendErrorWithFormatv("invalid module path '{0}'", path);
+      return;
+    }
+
+    ModuleSpec new_module_spec(file_spec);
+    if (!new_module_spec.GetArchitecture().IsValid())
+      new_module_spec.GetArchitecture() = target->GetArchitecture();
+
+    // Reject anything we can't use before looking at the target at all, and
+    // fill in the UUID of the new module so that we can look for a module in
+    // the target with the same one.
+    ModuleSpecList file_specs = ObjectFile::GetModuleSpecifications(
+        file_spec, /*file_offset=*/0, /*file_size=*/0);
+    if (file_specs.GetSize() == 0) {
+      result.AppendErrorWithFormatv("'{0}' is not a recognized object file",
+                                    file_spec.GetPath());
+      return;
+    }
+    ModuleSpec target_arch_spec;
+    target_arch_spec.GetArchitecture() = new_module_spec.GetArchitecture();
+    ModuleSpec arch_matched_spec;
+    if (!file_specs.FindMatchingModuleSpec(target_arch_spec,
+                                           arch_matched_spec)) {
+      result.AppendErrorWithFormatv(
+          "'{0}' does not contain a {1} object file", file_spec.GetPath(),
+          new_module_spec.GetArchitecture().GetTriple().getTriple());
+      return;
+    }
+    new_module_spec.GetUUID() = arch_matched_spec.GetUUID();
+
+    llvm::Expected<ModuleSP> old_module = FindModuleToReplace(new_module_spec);
+    if (!old_module) {
+      result.AppendError(llvm::toString(old_module.takeError()));
+      return;
+    }
+    ModuleSP old_module_sp = *old_module;
+
+    // Create the new module. Nothing in the target is modified until we know
+    // we have a usable module to put in place of the old one.
+    ModuleSP new_module_sp;
+    Status error = ModuleList::GetSharedModule(new_module_spec, new_module_sp,
+                                               /*old_modules=*/nullptr,
+                                               /*did_create_ptr=*/nullptr);
+    if (!new_module_sp || !new_module_sp->GetObjectFile()) {
+      result.AppendErrorWithFormatv("unable to create a module from '{0}'",
+                                    file_spec.GetPath());
+      if (error.Fail())
+        result.AppendError(error.AsCString());
+      return;
+    }
+    if (new_module_sp == old_module_sp) {
+      result.AppendErrorWithFormatv(
+          "'{0}' is already the module that would be replaced",
+          file_spec.GetPath());
+      return;
+    }
+
+    // Remember where the old module was loaded so that the new one can be
+    // loaded at the same address.
+    lldb::addr_t load_address = LLDB_INVALID_ADDRESS;
+    if (ObjectFile *object_file = old_module_sp->GetObjectFile())
+      load_address = object_file->GetBaseAddress().GetLoadAddress(target);
+
+    std::string old_path = old_module_sp->GetFileSpec().GetPath();
+
+    // Stop resolving addresses with the old module's sections, then swap the
+    // modules. ModuleList::ReplaceModule notifies the target, which moves any
+    // breakpoint locations that were resolved against the old module over to
+    // the new one and deletes the ones that no longer have an equivalent.
+    ModuleList &images = target->GetImages();
+    const size_t unloaded_sections =
+        target->UnloadModuleSections(old_module_sp);
+    if (images.GetIndexForModule(new_module_sp.get()) != LLDB_INVALID_INDEX32) {
+      // The replacement already is one of the target's modules. Drop the
+      // module it supersedes instead of adding a second copy of it.
+      images.Remove(old_module_sp);
+    } else if (!images.ReplaceModule(old_module_sp, new_module_sp)) {
+      result.AppendErrorWithFormatv("failed to replace module '{0}'", old_path);
+      return;
+    }
+
+    // Load the new module where the old one was.
+    if (load_address != LLDB_INVALID_ADDRESS) {
+      bool changed = false;
+      new_module_sp->SetLoadAddress(*target, load_address,
+                                    /*value_is_offset=*/false, changed);
+    } else if (unloaded_sections > 0) {
+      // The old module had sections loaded, but not at a single base address
+      // (its sections were loaded individually). There is nothing sensible to
+      // slide the new module by, so leave it unloaded and say so.
+      result.AppendWarningWithFormatv(
+          "'{0}' did not have a single load address; use \"target modules "
+          "load\" to load the sections of '{1}'",
+          old_path, new_module_sp->GetFileSpec().GetFilename());
+    }
+
+    if (target->GetPreloadSymbols())
+      new_module_sp->PreloadSymbols();
+
+    if (ProcessSP process_sp = target->GetProcessSP())
+      process_sp->Flush();
+
+    result.AppendMessageWithFormatv("module '{0}' has been replaced by '{1}'",
+                                    old_path,
+                                    new_module_sp->GetFileSpec().GetPath());
+    result.SetStatus(eReturnStatusSuccessFinishResult);
+  }
+};
+
 class CommandObjectTargetModulesLoad
     : public CommandObjectTargetModulesModuleAutoComplete {
 public:
@@ -3340,10 +3561,16 @@ protected:
         DumpModuleArchitecture(strm, module, true, width);
         break;
 
-      case 'f':
+      case 'f': {
         DumpFullpath(strm, &module->GetFileSpec(), width);
         dump_object_name = true;
-        break;
+        // Mark placeholder modules with a "(*)" so that users know the module
+        // has no real object file behind it and can be hydrated with
+        // "target modules replace".
+        ObjectFile *objfile = module->GetObjectFile();
+        if (objfile && objfile->GetPluginName() == "placeholder")
+          strm.PutCString("(*)");
+      } break;
 
       case 'd':
         DumpDirectory(strm, &module->GetFileSpec(), width);
@@ -4221,6 +4448,9 @@ public:
                                "target modules <sub-command> ...") {
     LoadSubCommand(
         "add", CommandObjectSP(new CommandObjectTargetModulesAdd(interpreter)));
+    LoadSubCommand(
+        "replace",
+        CommandObjectSP(new CommandObjectTargetModulesReplace(interpreter)));
     LoadSubCommand("load", CommandObjectSP(new CommandObjectTargetModulesLoad(
                                interpreter)));
     LoadSubCommand("dump", CommandObjectSP(new CommandObjectTargetModulesDump(

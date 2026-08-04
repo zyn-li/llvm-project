@@ -544,3 +544,137 @@ class MiniDumpNewTestCase(TestBase):
         finally:
             if os.path.isfile(core):
                 os.unlink(core)
+
+    PLACEHOLDER_PATH = "/file/does/not/exist/placeholder-module"
+
+    @skipIfLLVMTargetMissing("X86")
+    def test_replace_placeholder_module(self):
+        """
+        Test that "target modules replace" replaces a placeholder module with
+        the real one. The module to replace is found by matching the UUID of
+        the new module.
+        """
+        self.process_from_yaml("replace-module-with-uuid.yaml")
+        self.assertTrue(self.process.IsValid())
+
+        # The binary referenced by the minidump can't be found on the host, so
+        # LLDB created a placeholder module and the stack can't be symbolized.
+        self.assertEqual(self.target.GetNumModules(), 1)
+        module = self.target.GetModuleAtIndex(0)
+        self.assertEqual(module.GetFileSpec().fullpath, self.PLACEHOLDER_PATH)
+        thread = self.process.GetSelectedThread()
+        self.assertIsNone(thread.GetFrameAtIndex(0).GetFunctionName())
+        self.expect("image list -f", substrs=[self.PLACEHOLDER_PATH + "(*)"])
+
+        self.expect(
+            'target modules replace "%s"' % self.getSourcePath("linux-x86_64"),
+            substrs=["has been replaced by"],
+        )
+
+        # The placeholder is gone, replaced by the real module loaded at the
+        # same address, and the stack symbolizes.
+        self.assertEqual(self.target.GetNumModules(), 1)
+        module = self.target.GetModuleAtIndex(0)
+        self.assertEqual(module.GetFileSpec().GetFilename(), "linux-x86_64")
+        self.assertEqual(
+            module.GetObjectFileHeaderAddress().GetLoadAddress(self.target), 0x400000
+        )
+        self.expect("image list -f", matching=False, substrs=["(*)"])
+        thread = self.process.GetSelectedThread()
+        self.assertEqual(thread.GetFrameAtIndex(0).GetFunctionName(), "crash()")
+
+    @skipIfLLVMTargetMissing("X86")
+    def test_replace_placeholder_module_by_name(self):
+        """
+        Test that "target modules replace --shlib" replaces a placeholder
+        module whose name differs from the new module.
+        """
+        self.process_from_yaml("replace-module-without-uuid.yaml")
+        self.assertTrue(self.process.IsValid())
+        self.assertEqual(
+            self.target.GetModuleAtIndex(0).GetFileSpec().fullpath,
+            self.PLACEHOLDER_PATH,
+        )
+
+        # This minidump doesn't record a UUID for the module and the file names
+        # differ, so there is nothing to match the module on.
+        new_module = self.getSourcePath("linux-x86_64")
+        self.expect(
+            'target modules replace "%s"' % new_module,
+            error=True,
+            substrs=["no module in the target matches", "name linux-x86_64"],
+        )
+        # An explicit --shlib that matches nothing is an error, not a fallback.
+        self.expect(
+            'target modules replace "%s" --shlib no-such-module' % new_module,
+            error=True,
+            substrs=["no module in the target matches name no-such-module"],
+        )
+
+        self.expect(
+            'target modules replace "%s" --shlib placeholder-module' % new_module,
+            substrs=["has been replaced by"],
+        )
+
+        self.assertEqual(self.target.GetNumModules(), 1)
+        module = self.target.GetModuleAtIndex(0)
+        self.assertEqual(module.GetFileSpec().GetFilename(), "linux-x86_64")
+        self.assertEqual(
+            module.GetObjectFileHeaderAddress().GetLoadAddress(self.target), 0x400000
+        )
+        thread = self.process.GetSelectedThread()
+        self.assertEqual(thread.GetFrameAtIndex(0).GetFunctionName(), "crash()")
+
+    @skipIfLLVMTargetMissing("X86")
+    def test_replace_placeholder_module_errors(self):
+        """
+        Test that "target modules replace" leaves the target alone when it is
+        given something it cannot use.
+        """
+        self.process_from_yaml("replace-module-with-uuid.yaml")
+        self.assertTrue(self.process.IsValid())
+
+        self.expect(
+            "target modules replace /file/does/not/exist/either",
+            error=True,
+            substrs=["invalid module path"],
+        )
+        self.expect(
+            'target modules replace "%s"' % self.getSourcePath("linux-x86_64.cpp"),
+            error=True,
+            substrs=["is not a recognized object file"],
+        )
+        # A binary for the wrong architecture must be rejected rather than
+        # leaving the module without an object file.
+        self.expect(
+            'target modules replace "%s"'
+            % self.getSourcePath("../elf-core/linux-i386.out"),
+            error=True,
+            substrs=["does not contain a x86_64"],
+        )
+
+        # None of that touched the target.
+        self.assertEqual(self.target.GetNumModules(), 1)
+        module = self.target.GetModuleAtIndex(0)
+        self.assertEqual(module.GetFileSpec().fullpath, self.PLACEHOLDER_PATH)
+        self.assertEqual(
+            module.GetObjectFileHeaderAddress().GetLoadAddress(self.target), 0x400000
+        )
+
+    @skipIfLLVMTargetMissing("X86")
+    def test_replace_placeholder_module_resolves_breakpoints(self):
+        """
+        Test that a breakpoint that could not be resolved against a placeholder
+        module is resolved once the real module replaces it.
+        """
+        self.process_from_yaml("replace-module-with-uuid.yaml")
+        self.assertTrue(self.process.IsValid())
+
+        breakpoint = self.target.BreakpointCreateByName("crash")
+        self.assertEqual(breakpoint.GetNumLocations(), 0)
+
+        self.expect(
+            'target modules replace "%s"' % self.getSourcePath("linux-x86_64"),
+            substrs=["has been replaced by"],
+        )
+        self.assertEqual(breakpoint.GetNumLocations(), 1)

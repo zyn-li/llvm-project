@@ -3529,15 +3529,23 @@ size_t Target::UnloadModuleSections(const lldb::ModuleSP &module_sp) {
     stop_id = process_sp->GetStopID();
   else
     stop_id = m_section_load_history.GetLastStopID();
-  SectionList *sections = module_sp->GetSectionList();
   size_t section_unload_count = 0;
-  if (sections) {
-    const uint32_t num_sections = sections->GetNumSections(0);
-    for (uint32_t i = 0; i < num_sections; ++i) {
-      section_unload_count += m_section_load_history.SetSectionUnloaded(
-          stop_id, sections->GetSectionAtIndex(i));
-    }
-  }
+  // Child sections can be loaded individually (see "target modules load"), so
+  // unload the whole tree. Leaving a child section loaded would let it outlive
+  // the module it belongs to and keep resolving addresses.
+  std::function<void(SectionList *)> unload_sections =
+      [&](SectionList *sections) {
+        if (!sections)
+          return;
+        const size_t num_sections = sections->GetNumSections(0);
+        for (size_t i = 0; i < num_sections; ++i) {
+          SectionSP section_sp = sections->GetSectionAtIndex(i);
+          section_unload_count +=
+              m_section_load_history.SetSectionUnloaded(stop_id, section_sp);
+          unload_sections(&section_sp->GetChildren());
+        }
+      };
+  unload_sections(module_sp->GetSectionList());
   return section_unload_count;
 }
 
